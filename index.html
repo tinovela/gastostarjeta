@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Gestor de Gastos v5.7</title>
+    
+    <!-- React y ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Prop Types -->
+    <script src="https://unpkg.com/prop-types/prop-types.min.js"></script>
+    
+    <!-- Recharts -->
+    <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+    
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        body { background-color: #f8fafc; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .fade-enter { opacity: 0; }
+        .fade-enter-active { opacity: 1; transition: opacity 200ms; }
+        .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef, Component } = React;
+        const Recharts = window.Recharts || {};
+        const { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend } = Recharts;
+
+        // --- Error Boundary ---
+        class ErrorBoundary extends Component {
+            constructor(props) {
+                super(props);
+                this.state = { hasError: false, error: null };
+            }
+            static getDerivedStateFromError(error) { return { hasError: true, error }; }
+            resetApp = () => {
+                if(confirm("Esto borrará solo los gastos guardados en esta aplicación. ¿Continuar?")) {
+                    localStorage.removeItem('gastos_v4_db');
+                    localStorage.removeItem('gastos_v4_config');
+                    window.location.reload();
+                }
+            }
+            render() {
+                if (this.state.hasError) {
+                    return (
+                        <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center bg-gray-50">
+                            <div className="bg-white p-8 rounded-2xl shadow-xl border border-gray-100 max-w-sm">
+                                <h1 className="text-xl font-bold text-gray-800 mb-2">Error de Datos</h1>
+                                <button onClick={this.resetApp} className="w-full bg-orange-500 text-white px-4 py-3 rounded-xl font-bold mt-4">Reiniciar App</button>
+                            </div>
+                        </div>
+                    );
+                }
+                return this.props.children; 
+            }
+        }
+
+        // --- Helpers ---
+        const parseAmount = (val) => {
+            if (!val) return 0;
+            if (typeof val === 'number') return val;
+            let clean = val.toString().replace(/[^\d.,]/g, '').trim();
+            // Prioridad a formato 1.000,00
+            if (clean.includes(',') && clean.includes('.')) return parseFloat(clean.replace(/\./g, '').replace(',', '.'));
+            if (clean.includes(',')) return parseFloat(clean.replace(',', '.'));
+            return parseFloat(clean) || 0;
+        };
+
+        const getMonthDiff = (d1, d2) => (d2.getFullYear() - d1.getFullYear()) * 12 + (d2.getMonth() - d1.getMonth());
+
+        const downloadExcelCSV = (content, filename) => {
+            const blob = new Blob(["\uFEFF" + content], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.setAttribute("download", filename);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+
+        const CAT_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#6366f1', '#14b8a6', '#f97316'];
+
+        // --- App ---
+        function App() {
+            const [gastos, setGastos] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('gastos_v4_db');
+                    if (!saved) return [];
+                    const parsed = JSON.parse(saved);
+                    if (!Array.isArray(parsed)) return [];
+                    return parsed.map(g => ({
+                        ...g, id: g.id || Date.now() + Math.random(),
+                        fechaInicio: g.fechaInicio || new Date().toISOString().split('T')[0],
+                        montoTotal: Number(g.montoTotal) || 0,
+                        cuotas: Number(g.cuotas) || 1,
+                        concepto: g.concepto || "Sin nombre",
+                        skippedMonths: Array.isArray(g.skippedMonths) ? g.skippedMonths : []
+                    }));
+                } catch (e) { return []; }
+            });
+
+            const [config, setConfig] = useState(() => {
+                try { return JSON.parse(localStorage.getItem('gastos_v4_config') || '{"dolarTarjeta": 1350}'); } catch { return { dolarTarjeta: 1350 }; }
+            });
+
+            const [categorias, setCategorias] = useState(() => {
+                try { return JSON.parse(localStorage.getItem('gastos_v4_cats') || '["Supermercado","Streaming","Ropa","Salud","Hogar","Servicios","Auto","Varios"]'); } catch { return ["Varios"]; }
+            });
+            
+            const [viewDate, setViewDate] = useState(new Date()); 
+            const [currentView, setCurrentView] = useState('dashboard');
+            const [modalOpen, setModalOpen] = useState(false);
+            const [settingsOpen, setSettingsOpen] = useState(false);
+            const [skipperOpen, setSkipperOpen] = useState(false); 
+            const [editingGasto, setEditingGasto] = useState(null);
+            const [skipperGastoId, setSkipperGastoId] = useState(null); // Guardamos ID, no objeto
+
+            useEffect(() => localStorage.setItem('gastos_v4_db', JSON.stringify(gastos)), [gastos]);
+            useEffect(() => localStorage.setItem('gastos_v4_config', JSON.stringify(config)), [config]);
+            useEffect(() => localStorage.setItem('gastos_v4_cats', JSON.stringify(categorias)), [categorias]);
+            useEffect(() => { if (window.lucide) window.lucide.createIcons(); });
+
+            // Core Logic
+            const getGastosForDate = (targetDate) => {
+                const targetMonth = new Date(targetDate.getFullYear(), targetDate.getMonth(), 1);
+                const targetMonthStr = `${targetDate.getFullYear()}-${String(targetDate.getMonth() + 1).padStart(2, '0')}`;
+
+                return gastos.map(g => {
+                    try {
+                        if(!g.fechaInicio) return null;
+                        if (g.skippedMonths && g.skippedMonths.includes(targetMonthStr)) return null;
+
+                        const [y, m, d] = g.fechaInicio.split('-').map(Number);
+                        const start = new Date(y, m - 1, 1);
+                        let visible = false, monto = 0, info = "", remaining = 9999; 
+                        let deudaTotalRestante = 0;
+
+                        if (g.tipo === 'cuotas') {
+                            const diff = getMonthDiff(start, targetMonth);
+                            if (diff >= 0 && diff < g.cuotas) {
+                                visible = true;
+                                monto = g.montoTotal / g.cuotas;
+                                info = `${diff + 1}/${g.cuotas}`;
+                                remaining = g.cuotas - (diff + 1);
+                                const cuotasPendientes = g.cuotas - diff; 
+                                deudaTotalRestante = cuotasPendientes * (g.montoTotal / g.cuotas);
+                            }
+                        } else if (g.tipo === 'fijo') {
+                            if (targetMonth >= start) { visible = true; monto = g.montoTotal; info = "Fijo"; }
+                        } else if (g.tipo === 'unico') {
+                            if (getMonthDiff(start, targetMonth) === 0) { 
+                                visible = true; monto = g.montoTotal; info = "1/1"; remaining = 0; 
+                                deudaTotalRestante = g.montoTotal;
+                            }
+                        }
+
+                        if (!visible) return null;
+                        
+                        const montoARS = g.moneda === 'USD' ? monto * config.dolarTarjeta : monto;
+                        const deudaARS = g.moneda === 'USD' ? deudaTotalRestante * config.dolarTarjeta : deudaTotalRestante;
+
+                        return { ...g, montoPagar: monto, infoCuota: info, montoARS, remaining, deudaRestante: deudaARS };
+                    } catch (e) { return null; }
+                }).filter(Boolean);
+            };
+
+            const gastosDelMes = useMemo(() => getGastosForDate(viewDate).sort((a, b) => a.remaining - b.remaining), [gastos, viewDate, config]);
+            const totales = useMemo(() => gastosDelMes.reduce((acc, curr) => ({ ars: acc.ars + curr.montoARS, usd: acc.usd + (curr.moneda === 'USD' ? curr.montoPagar : 0) }), { ars: 0, usd: 0 }), [gastosDelMes]);
+
+            // Actions
+            const saveGasto = (g) => {
+                const cat = g.categoria.trim() || 'Varios';
+                if (!categorias.includes(cat)) setCategorias(prev => [...prev, cat].sort());
+                const finalGasto = { ...g, categoria: cat };
+                setGastos(prev => editingGasto ? prev.map(x => x.id === editingGasto.id ? { ...finalGasto, id: x.id } : x) : [...prev, { ...finalGasto, id: Date.now() }]);
+                setModalOpen(false); setEditingGasto(null);
+            };
+
+            const toggleMonthSkip = (gastoId, monthStr) => {
+                setGastos(prev => prev.map(g => {
+                    if (g.id !== gastoId) return g;
+                    const skipped = g.skippedMonths || [];
+                    if (skipped.includes(monthStr)) {
+                        return { ...g, skippedMonths: skipped.filter(m => m !== monthStr) };
+                    } else {
+                        return { ...g, skippedMonths: [...skipped, monthStr] };
+                    }
+                }));
+            };
+
+            const exportCurrentMonthCSV = () => {
+                let csv = "Fecha Mes;Concepto;Categoría;Info Cuota;Moneda;Monto Cuota;Monto ARS Estimado\n";
+                const mesStr = viewDate.toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
+                gastosDelMes.forEach(r => {
+                    const montoPagarFmt = r.montoPagar.toFixed(2).replace('.', ',');
+                    const montoARSFmt = r.montoARS.toFixed(2).replace('.', ',');
+                    const conceptoClean = (r.concepto || "").replace(/;/g, ' ');
+                    csv += `${mesStr};"${conceptoClean}";"${r.categoria}";"${r.infoCuota}";${r.moneda};${montoPagarFmt};${montoARSFmt}\n`;
+                });
+                downloadExcelCSV(csv, `resumen_${viewDate.getMonth()+1}_${viewDate.getFullYear()}.csv`);
+            };
+
+            return (
+                <div className="min-h-screen bg-gray-50 flex flex-col md:flex-row font-sans text-gray-800">
+                    <aside className="hidden md:flex flex-col w-64 bg-white border-r border-gray-200 h-screen sticky top-0 p-6 shadow-sm z-10">
+                        <div className="flex items-center gap-3 mb-10 text-blue-600">
+                            <div className="bg-blue-50 p-2 rounded-lg"><i data-lucide="wallet" className="w-6 h-6"></i></div>
+                            <h1 className="font-bold text-xl tracking-tight">Mis Finanzas</h1>
+                        </div>
+                        <nav className="space-y-2 flex-1">
+                            <NavBtn active={currentView==='dashboard'} onClick={()=>setCurrentView('dashboard')} icon="layout-grid" label="Resumen Mensual" />
+                            <NavBtn active={currentView==='fixed'} onClick={()=>setCurrentView('fixed')} icon="anchor" label="Gastos Fijos" />
+                            <NavBtn active={currentView==='projection'} onClick={()=>setCurrentView('projection')} icon="trending-up" label="Proyección" />
+                            <NavBtn active={currentView==='stats'} onClick={()=>setCurrentView('stats')} icon="pie-chart" label="Análisis y Deuda" />
+                            <NavBtn active={currentView==='calculator'} onClick={()=>setCurrentView('calculator')} icon="calculator" label="Calculadora" />
+                        </nav>
+                        <NavBtn onClick={()=>setSettingsOpen(true)} icon="settings" label="Configuración" />
+                    </aside>
+
+                    <header className="md:hidden bg-white border-b border-gray-200 p-4 sticky top-0 z-20 flex justify-between items-center">
+                        <div className="flex items-center gap-2 text-blue-600 font-bold">
+                            <i data-lucide="wallet" className="w-5 h-5"></i> Mis Finanzas
+                        </div>
+                        <button onClick={()=>setSettingsOpen(true)} className="p-2 bg-gray-50 rounded-full"><i data-lucide="settings" className="w-5 h-5 text-gray-600"></i></button>
+                    </header>
+
+                    <main className="flex-1 overflow-y-auto h-[calc(100vh-60px)] md:h-screen p-4 md:p-8 pb-24 md:pb-8">
+                        {currentView !== 'projection' && currentView !== 'fixed' && currentView !== 'calculator' && (
+                            <div className="flex justify-between items-center mb-6 bg-white p-2 rounded-xl border border-gray-200 shadow-sm max-w-sm mx-auto md:mx-0">
+                                <button onClick={()=>setViewDate(new Date(viewDate.getFullYear(), viewDate.getMonth()-1, 1))} className="p-2 hover:bg-gray-100 rounded-lg"><i data-lucide="chevron-left"></i></button>
+                                <div className="text-center">
+                                    <span className="text-xs font-bold text-gray-400 uppercase block">Vencimiento</span>
+                                    <span className="font-bold capitalize text-lg">{viewDate.toLocaleDateString('es-AR', {month:'long', year:'numeric'})}</span>
+                                </div>
+                                <button onClick={()=>setViewDate(new Date(viewDate.getFullYear(), viewDate.getMonth()+1, 1))} className="p-2 hover:bg-gray-100 rounded-lg"><i data-lucide="chevron-right"></i></button>
+                            </div>
+                        )}
+
+                        {currentView === 'dashboard' && <Dashboard gastos={gastosDelMes} total={totales} onEdit={(g)=>{setEditingGasto(g); setModalOpen(true);}} />}
+                        {currentView === 'fixed' && <FixedExpensesView gastos={gastos} config={config} onEdit={(g)=>{setEditingGasto(g); setModalOpen(true);}} onOpenSkipper={(id)=>{setSkipperGastoId(id); setSkipperOpen(true);}} />}
+                        {currentView === 'projection' && <Projection gastos={gastos} current={viewDate} calculator={getGastosForDate} />}
+                        {currentView === 'stats' && <Stats gastos={gastos} currentMonthGastos={gastosDelMes} total={totales.ars} colors={CAT_COLORS} config={config} currentDate={viewDate} />}
+                        {currentView === 'calculator' && <FinancialCalculator />}
+                    </main>
+
+                    <nav className="md:hidden fixed bottom-0 w-full bg-white border-t border-gray-200 p-1 flex justify-around pb-safe z-30">
+                        <MobBtn active={currentView==='dashboard'} onClick={()=>setCurrentView('dashboard')} icon="layout-grid" label="Resumen" />
+                        <MobBtn active={currentView==='fixed'} onClick={()=>setCurrentView('fixed')} icon="anchor" label="Fijos" />
+                        <div className="relative -top-5">
+                            <button onClick={()=>{setEditingGasto(null); setModalOpen(true);}} className="bg-blue-600 text-white p-3.5 rounded-full shadow-lg shadow-blue-200 active:scale-95 transition-transform"><i data-lucide="plus" className="w-6 h-6"></i></button>
+                        </div>
+                        <MobBtn active={currentView==='stats'} onClick={()=>setCurrentView('stats')} icon="pie-chart" label="Stats" />
+                        <MobBtn active={currentView==='calculator'} onClick={()=>setCurrentView('calculator')} icon="calculator" label="Calc" />
+                    </nav>
+
+                    <button onClick={()=>{setEditingGasto(null); setModalOpen(true);}} className="hidden md:flex fixed bottom-8 right-8 bg-blue-600 text-white px-6 py-4 rounded-full shadow-xl hover:bg-blue-700 transition items-center gap-2 font-bold z-40">
+                        <i data-lucide="plus"></i> Nuevo Gasto
+                    </button>
+
+                    {modalOpen && <FormModal onClose={()=>setModalOpen(false)} onSave={saveGasto} onDelete={(id)=>{setGastos(prev=>prev.filter(x=>x.id!==id)); setModalOpen(false);}} initial={editingGasto} cats={categorias} viewDate={viewDate} />}
+                    {settingsOpen && <ConfigModal onClose={()=>setSettingsOpen(false)} config={config} setConfig={setConfig} data={gastos} exportCurrent={exportCurrentMonthCSV} />}
+                    {skipperOpen && skipperGastoId && <MonthSkipperModal onClose={()=>setSkipperOpen(false)} gastos={gastos} gastoId={skipperGastoId} onToggle={toggleMonthSkip} />}
+                </div>
+            );
+        }
+
+        const NavBtn = ({active, onClick, icon, label}) => <button onClick={onClick} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${active?'bg-blue-50 text-blue-700 font-bold shadow-sm ring-1 ring-blue-100':'text-gray-500 hover:bg-gray-50 hover:text-gray-900'}`}><i data-lucide={icon} className="w-5 h-5"></i> {label}</button>;
+        const MobBtn = ({active, onClick, icon, label}) => <button onClick={onClick} className={`flex flex-col items-center p-2 rounded-lg ${active?'text-blue-600':'text-gray-400'}`}><i data-lucide={icon} className="w-5 h-5"></i><span className="text-[10px] font-medium mt-1">{label}</span></button>;
+
+        function FinancialCalculator() {
+            const [val, setVal] = useState({ contado: '', cuotas: '', num: 3, tna: 40, sellos: 1.5, extras: 0 });
+            const [res, setRes] = useState(null);
+            const calculate = () => {
+                const P_contado = parseFloat(val.contado) || 0; const P_cuotas = parseFloat(val.cuotas) || P_contado; const N = parseInt(val.num) || 1; const TNA = parseFloat(val.tna) || 0; const SELLOS = (parseFloat(val.sellos) || 0) / 100; const EXTRA = parseFloat(val.extras) || 0;
+                if (!P_contado || !N) return;
+                const monthlyRate = TNA / 100 / 12; const cuotaAmount = P_cuotas / N; const impuestoSellos = P_cuotas * SELLOS; 
+                let capital = P_contado; 
+                for (let i = 1; i <= N; i++) { capital += capital * monthlyRate; let pago = cuotaAmount + EXTRA; if (i === 1) pago += impuestoSellos; capital -= pago; }
+                setRes({ ganancia: capital });
+            };
+            return (
+                <div className="animate-fade-in space-y-6 max-w-2xl mx-auto">
+                    <h2 className="text-2xl font-bold text-gray-800 flex items-center gap-2"><i data-lucide="calculator" className="text-blue-600"></i> Calculadora Financiera</h2>
+                    <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-200 space-y-4">
+                        <div className="grid grid-cols-2 gap-4"><div><label className="label">Precio Contado ($)</label><input type="number" className="input" value={val.contado} onChange={e=>setVal({...val, contado:e.target.value})} /></div><div><label className="label">Precio Cuotas ($)</label><input type="number" className="input" value={val.cuotas} onChange={e=>setVal({...val, cuotas:e.target.value})} /></div></div>
+                        <div className="grid grid-cols-3 gap-4"><div><label className="label">Cuotas</label><input type="number" className="input" value={val.num} onChange={e=>setVal({...val, num:e.target.value})} /></div><div><label className="label flex items-center gap-1">TNA (%) <a href="https://www.bcra.gob.ar/BCRAyVos/Plazos_fijos_online.asp" target="_blank" className="text-blue-600"><i data-lucide="external-link" className="w-3 h-3"></i></a></label><input type="number" className="input" value={val.tna} onChange={e=>setVal({...val, tna:e.target.value})} /></div><div><label className="label">Sellos (%)</label><input type="number" className="input" value={val.sellos} onChange={e=>setVal({...val, sellos:e.target.value})} /></div></div>
+                        <div><label className="label">Costo Extra Mensual ($)</label><input type="number" className="input" value={val.extras} onChange={e=>setVal({...val, extras:e.target.value})} /></div>
+                        <button onClick={calculate} className="w-full bg-blue-600 text-white font-bold py-3 rounded-xl shadow-lg hover:bg-blue-700">Calcular</button>
+                    </div>
+                    {res && (<div className={`p-6 rounded-2xl shadow-lg text-white animate-slide-up ${res.ganancia > 0 ? 'bg-green-600' : 'bg-red-500'}`}><h3 className="text-lg font-medium opacity-90 mb-1">Resultado</h3><div className="text-3xl font-bold mb-2">{res.ganancia > 0 ? "¡CONVIENE CUOTAS!" : "MEJOR CONTADO"}</div><p className="opacity-90">{res.ganancia > 0 ? `Ganancia estimada: $ ${res.ganancia.toLocaleString('es-AR', {maximumFractionDigits:0})}` : `Pérdida estimada: $ ${Math.abs(res.ganancia).toLocaleString('es-AR', {maximumFractionDigits:0})}`}</p></div>)}
+                </div>
+            );
+        }
+
+        function Dashboard({ gastos, total, onEdit }) {
+            const breakdown = useMemo(() => gastos.reduce((acc, g) => { if (g.tipo === 'fijo') { acc.fijos += g.montoARS; } else { acc.cuotas += g.montoARS; if (g.remaining === 0) acc.liberado += g.montoARS; } return acc; }, { fijos: 0, cuotas: 0, liberado: 0 }), [gastos]);
+            return (
+                <div className="animate-fade-in space-y-6">
+                    <div className="grid md:grid-cols-3 gap-4">
+                        <div className="md:col-span-2 bg-gradient-to-br from-blue-600 to-indigo-700 rounded-2xl p-6 text-white shadow-xl relative overflow-hidden">
+                            <div className="relative z-10">
+                                <div><span className="text-blue-100 text-sm font-medium">Total Estimado</span><h2 className="text-4xl md:text-5xl font-bold mt-1 mb-2">$ {total.ars.toLocaleString('es-AR', {maximumFractionDigits:0})}</h2>{total.usd > 0 && <div className="inline-flex items-center gap-2 bg-white/10 px-3 py-1 rounded-full border border-white/20 text-xs mb-3"><i data-lucide="dollar-sign" className="w-3 h-3"></i> {total.usd.toFixed(2)} USD</div>}</div>
+                                <div className="grid grid-cols-3 gap-2 mt-3 pt-4 border-t border-white/10">
+                                    <div><div className="flex items-center gap-1.5 text-blue-200 text-[10px] font-bold uppercase mb-1"><i data-lucide="credit-card" className="w-3 h-3"></i> Cuotas</div><p className="text-lg font-bold tracking-tight">$ {breakdown.cuotas.toLocaleString('es-AR', {maximumFractionDigits:0})}</p></div>
+                                    <div><div className="flex items-center gap-1.5 text-purple-200 text-[10px] font-bold uppercase mb-1"><i data-lucide="anchor" className="w-3 h-3"></i> Fijos</div><p className="text-lg font-bold tracking-tight">$ {breakdown.fijos.toLocaleString('es-AR', {maximumFractionDigits:0})}</p></div>
+                                    <div className="bg-white/10 rounded-lg p-1.5 -my-1 border border-white/20"><div className="flex items-center gap-1.5 text-green-200 text-[10px] font-bold uppercase mb-1"><i data-lucide="unlock" className="w-3 h-3"></i> Se libera</div><p className="text-lg font-bold tracking-tight text-green-100">$ {breakdown.liberado.toLocaleString('es-AR', {maximumFractionDigits:0})}</p></div>
+                                </div>
+                            </div>
+                            <i data-lucide="credit-card" className="absolute -right-4 -bottom-8 w-48 h-48 text-white/10 rotate-12"></i>
+                        </div>
+                        <div className="bg-white p-6 rounded-2xl border border-gray-100 shadow-sm flex flex-col justify-center items-center"><div className="w-12 h-12 bg-green-50 rounded-full flex items-center justify-center text-green-600 mb-2"><i data-lucide="shopping-bag"></i></div><span className="text-2xl font-bold">{gastos.length}</span><span className="text-gray-400 text-sm">Items</span></div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        {gastos.length===0 ? <div className="col-span-full py-10 text-center text-gray-400">Sin movimientos</div> : 
+                        gastos.map(g => (
+                            <div key={g.id} onClick={()=>onEdit(g)} className={`p-4 rounded-xl border shadow-sm hover:shadow-md transition cursor-pointer group ${g.remaining === 0 ? 'bg-green-50 border-green-200' : 'bg-white border-gray-200'}`}>
+                                <div className="flex justify-between items-start mb-3">
+                                    <div><h3 className="font-bold text-gray-800 line-clamp-1 group-hover:text-blue-600">{g.concepto}</h3><span className="text-xs text-gray-400 bg-white/50 px-2 py-0.5 rounded border border-gray-100">{g.categoria}</span></div>
+                                    <span className={`text-[10px] font-bold px-2 py-1 rounded-full ${g.remaining === 0 ? 'bg-green-100 text-green-700' : (g.tipo==='fijo'?'bg-purple-100 text-purple-700':'bg-blue-50 text-blue-600')}`}>{g.infoCuota}</span>
+                                </div>
+                                <div className="flex justify-between items-end">
+                                    <span className="text-xs font-mono text-gray-400">{g.moneda}</span>
+                                    <div className="text-right">
+                                        <div className="font-bold text-lg">{g.moneda==='USD'?'U$S':'$'} {g.montoPagar.toLocaleString('es-AR',{minimumFractionDigits:2})}</div>
+                                        {g.deudaRestante > 0 && <div className="text-[10px] text-gray-400 mt-0.5">Resta abonar: $ {g.deudaRestante.toLocaleString('es-AR', {maximumFractionDigits:0})}</div>}
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            );
+        }
+
+        // --- FIXED EXPENSES WITH SKIPPER ---
+        function FixedExpensesView({ gastos, config, onEdit, onOpenSkipper }) {
+            const fijos = gastos.filter(g => g.tipo === 'fijo');
+            const totalFijo = fijos.reduce((acc, curr) => ({ ars: acc.ars + (curr.moneda === 'USD' ? curr.montoTotal * config.dolarTarjeta : curr.montoTotal), usd: acc.usd + (curr.moneda === 'USD' ? curr.montoTotal : 0) }), { ars: 0, usd: 0 });
+            return (
+                <div className="animate-fade-in space-y-6">
+                    <h2 className="text-2xl font-bold text-gray-800">Gastos Fijos</h2>
+                    <div className="bg-gradient-to-r from-purple-600 to-indigo-600 rounded-2xl p-6 text-white shadow-lg"><p className="text-purple-100 text-sm font-medium mb-1">Costo Fijo Mensual</p><h2 className="text-3xl font-bold">$ {totalFijo.ars.toLocaleString('es-AR', {maximumFractionDigits:0})}</h2>{totalFijo.usd > 0 && <p className="text-sm opacity-80 mt-1">Incluye U$S {totalFijo.usd.toFixed(2)}</p>}</div>
+                    <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+                        {fijos.length === 0 ? <div className="p-8 text-center text-gray-400"><p>No tienes gastos fijos.</p></div> : 
+                        <div className="divide-y divide-gray-100">
+                            {fijos.map(g => (
+                                <div key={g.id} className="p-4 flex justify-between items-center hover:bg-gray-50 transition group">
+                                    <div className="flex items-center gap-3 cursor-pointer flex-1" onClick={() => onEdit(g)}>
+                                        <div className="bg-purple-100 text-purple-600 p-2 rounded-full"><i data-lucide="repeat" className="w-4 h-4"></i></div>
+                                        <div><h4 className="font-bold text-gray-800">{g.concepto}</h4><span className="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded">{g.categoria}</span></div>
+                                    </div>
+                                    <div className="flex items-center gap-4">
+                                        <div className="text-right cursor-pointer" onClick={() => onEdit(g)}>
+                                            <div className="font-bold text-gray-700">{g.moneda==='USD'?'U$S':'$'} {g.montoTotal.toLocaleString('es-AR', {minimumFractionDigits: 2})}</div>
+                                        </div>
+                                        <button onClick={(e) => { e.stopPropagation(); onOpenSkipper(g.id); }} className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-full transition" title="Gestionar meses activos">
+                                            <i data-lucide="calendar-clock" className="w-5 h-5"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>}
+                    </div>
+                </div>
+            );
+        }
+
+        function MonthSkipperModal({ onClose, gastos, gastoId, onToggle }) {
+            const gasto = useMemo(() => gastos.find(g => g.id === gastoId), [gastos, gastoId]);
+            const months = useMemo(() => {
+                const today = new Date();
+                const ms = [];
+                for(let i=0; i<12; i++) {
+                    const d = new Date(today.getFullYear(), today.getMonth()+i, 1);
+                    const iso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+                    ms.push({ date: d, iso });
+                }
+                return ms;
+            }, []);
+
+            if (!gasto) return null;
+
+            return (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 backdrop-blur-sm animate-fade-in">
+                    <div className="bg-white w-full max-w-sm rounded-2xl p-6 shadow-2xl">
+                        <h3 className="font-bold text-lg mb-2">Gestionar Meses Activos</h3>
+                        <p className="text-sm text-gray-500 mb-4">Desmarca los meses donde no pagas este servicio (ej. promociones, vacaciones).</p>
+                        <div className="bg-gray-50 rounded-xl p-2 max-h-60 overflow-y-auto mb-4 border border-gray-100">
+                            {months.map(m => {
+                                const isSkipped = gasto.skippedMonths && gasto.skippedMonths.includes(m.iso);
+                                const isActive = !isSkipped;
+                                return (
+                                    <div key={m.iso} onClick={() => onToggle(gasto.id, m.iso)} className="flex items-center justify-between p-3 hover:bg-white rounded-lg cursor-pointer border-b border-gray-100 last:border-0 transition">
+                                        <span className="capitalize text-gray-700 font-medium">{m.date.toLocaleDateString('es-AR', { month: 'long', year: 'numeric' })}</span>
+                                        {isActive ? <i data-lucide="check-circle-2" className="text-green-500 w-5 h-5"></i> : <i data-lucide="circle" className="text-gray-300 w-5 h-5"></i>}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        <button onClick={onClose} className="w-full bg-blue-600 text-white font-bold py-3 rounded-xl shadow-lg hover:bg-blue-700">Listo</button>
+                    </div>
+                </div>
+            );
+        }
+
+        function Projection({ gastos, current, calculator }) {
+            const months = useMemo(() => Array.from({length:12}, (_, i) => { const d = new Date(current.getFullYear(), current.getMonth()+i, 1); const items = calculator(d).sort((a, b) => a.remaining - b.remaining); return { d, items, total: items.reduce((s, x)=>s+x.montoARS, 0) }; }), [gastos, current]);
+            return (
+                <div className="overflow-x-auto pb-4 animate-fade-in"><div className="flex gap-4 min-w-max">{months.map((m, i) => (
+                    <div key={i} className={`w-72 bg-white rounded-xl border flex flex-col shadow-sm ${i===0?'border-blue-500 ring-1 ring-blue-500':'border-gray-200'}`}>
+                        <div className={`p-4 border-b ${i===0?'bg-blue-50':'bg-gray-50'} rounded-t-xl`}><h4 className="capitalize font-bold text-gray-600">{m.d.toLocaleDateString('es-AR',{month:'long', year:'numeric'})}</h4><p className="text-2xl font-bold text-gray-900 mt-1">$ {m.total.toLocaleString('es-AR',{maximumFractionDigits:0})}</p></div>
+                        <div className="p-3 flex-1 overflow-y-auto max-h-[50vh] space-y-2">
+                            {m.items.map((x, idx) => (<div key={idx} className={`flex justify-between text-sm p-2 rounded ${x.remaining === 0 ? 'bg-green-50 border border-green-100' : 'hover:bg-gray-50'}`}><div className="truncate flex-1 pr-2"><div className="font-medium text-gray-700 truncate">{x.concepto}</div><span className={`text-[10px] px-1 rounded ${x.remaining === 0 ? 'bg-green-200 text-green-800 font-bold' : 'bg-gray-100 text-gray-500'}`}>{x.infoCuota}</span></div><div className="font-mono text-gray-600">$ {Math.round(x.montoARS)}</div></div>))}
+                        </div>
+                    </div>
+                ))}</div></div>
+            );
+        }
+
+        // --- STATS WITH ACCORDION DEBT ---
+        function Stats({ gastos, currentMonthGastos, total, colors, config, currentDate }) {
+            const dataMonth = useMemo(() => { const map = {}; currentMonthGastos.forEach(g => map[g.categoria] = (map[g.categoria]||0) + g.montoARS); return Object.entries(map).map(([name, value]) => ({name, value})).sort((a,b)=>b.value-a.value); }, [currentMonthGastos]);
+            
+            const [expandedCat, setExpandedCat] = useState(null);
+
+            const debtData = useMemo(() => {
+                const map = {}; // category -> total
+                const details = {}; // category -> [items]
+                let granTotal = 0;
+                const currentMonthStart = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1);
+
+                gastos.forEach(g => {
+                    if(g.tipo !== 'cuotas' && g.tipo !== 'unico') return; 
+                    // Unico payment also counts as debt if future
+                    const parts = (g.fechaInicio || "").split('-'); if(parts.length!==3) return;
+                    const [y, m, d] = parts.map(Number); const start = new Date(y, m - 1, 1);
+                    const diff = getMonthDiff(start, currentMonthStart);
+                    
+                    let remainingInstallments = 0;
+                    if (g.tipo === 'cuotas') {
+                        if (diff >= 0 && diff < g.cuotas) remainingInstallments = g.cuotas - diff; 
+                        else if (diff < 0) remainingInstallments = g.cuotas;
+                    } else {
+                        if (diff < 0) remainingInstallments = 1; // Future single payment
+                        else if (diff === 0) remainingInstallments = 1; // Current single payment (is debt until paid)
+                    }
+
+                    if (remainingInstallments > 0) {
+                        const debt = remainingInstallments * (g.montoTotal / (g.tipo === 'cuotas' ? g.cuotas : 1));
+                        const debtARS = g.moneda === 'USD' ? debt * config.dolarTarjeta : debt;
+                        map[g.categoria] = (map[g.categoria] || 0) + debtARS;
+                        if (!details[g.categoria]) details[g.categoria] = [];
+                        details[g.categoria].push({ ...g, debtARS, remainingInstallments });
+                        granTotal += debtARS;
+                    }
+                });
+                
+                // Sort items inside details by debt amount
+                Object.keys(details).forEach(cat => {
+                    details[cat].sort((a, b) => b.debtARS - a.debtARS);
+                });
+
+                return { 
+                    list: Object.entries(map).map(([name, value]) => ({name, value, items: details[name]})).sort((a,b)=>b.value-a.value), // Sort by value desc
+                    total: granTotal
+                };
+            }, [gastos, config, currentDate]);
+
+            if(!PieChart) return null;
+            return (
+                <div className="space-y-8 animate-fade-in">
+                    <div className="grid md:grid-cols-2 gap-8 bg-white p-6 rounded-2xl shadow-sm border border-gray-200">
+                        <div><h3 className="font-bold text-gray-800 mb-4">Gasto por Categoría (Mes)</h3><div className="h-64"><ResponsiveContainer><PieChart><Pie data={dataMonth} innerRadius={60} outerRadius={80} paddingAngle={2} dataKey="value">{dataMonth.map((_, i) => <Cell key={i} fill={colors[i%colors.length]} />)}</Pie><Tooltip formatter={(v)=>`$${v.toLocaleString()}`} /><Legend /></PieChart></ResponsiveContainer></div></div>
+                        <div className="space-y-3">{dataMonth.map((x, i) => (<div key={i} className="flex items-center justify-between p-2 rounded hover:bg-gray-50"><div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor:colors[i%colors.length]}}></div><span className="font-medium text-sm text-gray-700">{x.name}</span></div><div className="text-right"><div className="font-bold text-sm">$ {x.value.toLocaleString()}</div><div className="text-xs text-gray-400">{((x.value/total)*100).toFixed(1)}%</div></div></div>))}</div>
+                    </div>
+
+                    <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-200">
+                        <div className="flex justify-between items-center mb-6"><h3 className="font-bold text-gray-800 flex items-center gap-2"><i data-lucide="layers" className="text-red-500"></i> Pasivo / Deuda Futura</h3><span className="bg-red-50 text-red-600 px-3 py-1 rounded-lg text-sm font-bold">$ {debtData.total.toLocaleString('es-AR', {maximumFractionDigits: 0})}</span></div>
+                        <p className="text-xs text-gray-400 mb-4">Toca una categoría para ver el detalle de deudas.</p>
+                        
+                        <div className="space-y-3">
+                            {debtData.list.map((x, i) => (
+                                <div key={i} className="border border-gray-100 rounded-xl overflow-hidden">
+                                    <div onClick={() => setExpandedCat(expandedCat === x.name ? null : x.name)} className="cursor-pointer hover:bg-gray-50 transition p-3">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-bold uppercase text-gray-500">{x.name}</span>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <span className="font-bold text-gray-700">$ {x.value.toLocaleString('es-AR', {maximumFractionDigits:0})}</span>
+                                                <i data-lucide={expandedCat === x.name ? "chevron-up" : "chevron-down"} className="w-4 h-4 text-gray-400"></i>
+                                            </div>
+                                        </div>
+                                        {/* Progress Bar added here */}
+                                        <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
+                                            <div className="bg-red-400 h-1.5 rounded-full" style={{ width: `${(x.value / debtData.total) * 100}%` }}></div>
+                                        </div>
+                                    </div>
+                                    {expandedCat === x.name && (
+                                        <div className="bg-white p-3 space-y-2 border-t border-gray-100 animate-fade-in">
+                                            {x.items.map(item => (
+                                                <div key={item.id} className="flex justify-between text-sm text-gray-600 border-b border-gray-50 last:border-0 pb-1 last:pb-0">
+                                                    <span className="truncate w-1/2">{item.concepto}</span>
+                                                    <div className="text-right">
+                                                        <span className="block font-medium">$ {item.debtARS.toLocaleString('es-AR', {maximumFractionDigits:0})}</span>
+                                                        <span className="text-[10px] text-gray-400">Restan {item.remainingInstallments} cuotas</span>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                            {debtData.list.length === 0 && <p className="text-center text-gray-400 py-4">¡Libre de deudas! 🎉</p>}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // --- Forms (Same as before) ---
+        function FormModal({ onClose, onSave, onDelete, initial, cats, viewDate }) {
+            const [mode, setMode] = useState('total');
+            const [data, setData] = useState(initial || { concepto: '', montoTotal: '', moneda: 'ARS', tipo: 'cuotas', cuotas: 1, fechaInicio: new Date(viewDate).toISOString().split('T')[0], categoria: '' });
+            const [cuotaVal, setCuotaVal] = useState(''); const [smartText, setSmartText] = useState(''); const [currentQuoteNum, setCurrentQuoteNum] = useState(1);
+            const [catOpen, setCatOpen] = useState(false); const [dropdownPos, setDropdownPos] = useState({ top: 0, left: 0, width: 0 }); const catInputRef = useRef(null); const dropdownRef = useRef(null);
+
+            useEffect(() => { if(initial && initial.cuotas) setCuotaVal((initial.montoTotal/initial.cuotas).toFixed(2)); }, [initial]);
+            useEffect(() => { if(mode==='cuota' && cuotaVal && data.cuotas) setData(d => ({...d, montoTotal: parseFloat(cuotaVal)*parseInt(d.cuotas)})); }, [cuotaVal, data.cuotas, mode]);
+            useEffect(() => { const handleClickOutside = (event) => { if (catOpen && catInputRef.current && !catInputRef.current.contains(event.target) && dropdownRef.current && !dropdownRef.current.contains(event.target)) setCatOpen(false); }; document.addEventListener('mousedown', handleClickOutside); return () => { document.removeEventListener('mousedown', handleClickOutside); }; }, [catOpen]);
+            const updateDropdownPosition = () => { if (catInputRef.current) { const rect = catInputRef.current.getBoundingClientRect(); setDropdownPos({ top: rect.bottom + 5, left: rect.left, width: rect.width }); } };
+            const openDropdown = () => { updateDropdownPosition(); setCatOpen(true); };
+            useEffect(() => { const handleScroll = (event) => { if (catOpen && dropdownRef.current && !dropdownRef.current.contains(event.target)) setCatOpen(false); }; const handleResize = () => { if (catOpen) setCatOpen(false); }; window.addEventListener('scroll', handleScroll, true); window.addEventListener('resize', handleResize); return () => { window.removeEventListener('scroll', handleScroll, true); window.removeEventListener('resize', handleResize); }; }, [catOpen]);
+            const filteredCats = useMemo(() => { const term = data.categoria.toLowerCase(); if (!term) return cats; if (cats.some(c => c.toLowerCase() === term)) return cats; return cats.filter(c => c.toLowerCase().includes(term)); }, [data.categoria, cats]);
+            
+            // Smart Paste Refined: avoid integers < 1000 being detected as amounts if money string exists
+            const handleSmartPaste = (e) => { 
+                const txt = e.target.value; setSmartText(txt); 
+                const quoteRegex = /(\d{1,2})\/(\d{1,2})/; 
+                // Regex for currency: needs dot or comma plus digits. excludes simple integers.
+                const amountRegex = /(?:\$)?\s?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))/g; 
+                
+                const quoteMatch = txt.match(quoteRegex); 
+                const amounts = txt.match(amountRegex); 
+                let newConcept = txt, newTotalQuotes = 1, newCurrentQuote = 1, newAmount = 0; 
+                
+                if (quoteMatch) { 
+                    newCurrentQuote = parseInt(quoteMatch[1]); 
+                    newTotalQuotes = parseInt(quoteMatch[2]); 
+                    newConcept = newConcept.replace(quoteMatch[0], '').replace('Cuota', '').trim(); 
+                } 
+                
+                if (amounts && amounts.length > 0) { 
+                    // Pick the last match that looks like money (biggest usually)
+                    const rawAmount = amounts[amounts.length - 1].replace('$','').trim(); 
+                    newAmount = parseAmount(rawAmount); 
+                    // Replace all money-like strings to clean concept
+                    amounts.forEach(amt => { newConcept = newConcept.replace(amt, '').trim(); });
+                    newConcept = newConcept.replace(/[-$]/g, '').trim(); 
+                } 
+                
+                const startMonth = new Date(viewDate.getFullYear(), viewDate.getMonth() - (newCurrentQuote - 1), 1); 
+                setData(prev => ({ ...prev, concepto: newConcept || prev.concepto, cuotas: newTotalQuotes, tipo: newTotalQuotes > 1 ? 'cuotas' : 'unico', fechaInicio: startMonth.toISOString().split('T')[0], montoTotal: newAmount * newTotalQuotes })); 
+                setCurrentQuoteNum(newCurrentQuote); setCuotaVal(newAmount); setMode('cuota'); 
+            };
+            
+            const handleCurrentQuoteChange = (val) => { const curr = parseInt(val) || 1; setCurrentQuoteNum(curr); const startMonth = new Date(viewDate.getFullYear(), viewDate.getMonth() - (curr - 1), 1); setData(prev => ({...prev, fechaInicio: startMonth.toISOString().split('T')[0]})); };
+
+            return (
+                <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm animate-fade-in">
+                    <div className="bg-white w-full max-w-lg rounded-2xl shadow-2xl flex flex-col max-h-[90vh]">
+                        <div className="p-4 border-b flex justify-between items-center bg-gray-50 rounded-t-2xl"><h3 className="font-bold text-lg text-gray-800">{initial?'Editar':'Nuevo'} Gasto</h3><button onClick={onClose}><i data-lucide="x" className="text-gray-400"></i></button></div>
+                        <div className="p-6 overflow-y-auto space-y-5">
+                            {!initial && (<div className="bg-blue-50 border-2 border-blue-100 border-dashed rounded-xl p-3"><label className="text-xs font-bold text-blue-600 uppercase mb-1 block">Pegar línea del resumen</label><input value={smartText} onChange={handleSmartPaste} placeholder="Ej: ZARA Cuota 03/06 12.500,00" className="w-full bg-white border border-blue-200 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" /><p className="text-[10px] text-blue-400 mt-1">Detecta concepto, cuotas y monto automáticamente.</p></div>)}
+                            <div><label className="label">Concepto</label><input value={data.concepto} onChange={e=>setData({...data, concepto:e.target.value})} className="input text-lg font-medium" placeholder="Descripción..." autoFocus /></div>
+                            <div className="grid grid-cols-2 gap-4"><div><label className="label">Tipo</label><select value={data.tipo} onChange={e=>setData({...data, tipo:e.target.value})} className="input"><option value="cuotas">Cuotas</option><option value="fijo">Fijo Mensual</option><option value="unico">Pago Único</option></select></div><div><label className="label">Moneda</label><select value={data.moneda} onChange={e=>setData({...data, moneda:e.target.value})} className="input"><option value="ARS">ARS ($)</option><option value="USD">USD (U$S)</option></select></div></div>
+                            <div className="bg-gray-50 p-4 rounded-xl border border-gray-200">
+                                {data.tipo === 'cuotas' && (<div className="flex gap-2 mb-4 bg-white p-1 rounded-lg border border-gray-200"><button onClick={()=>setMode('total')} className={`flex-1 py-1 text-xs font-bold rounded ${mode==='total'?'bg-gray-800 text-white shadow':'text-gray-500'}`}>Total Compra</button><button onClick={()=>setMode('cuota')} className={`flex-1 py-1 text-xs font-bold rounded ${mode==='cuota'?'bg-gray-800 text-white shadow':'text-gray-500'}`}>Valor Cuota</button></div>)}
+                                <div className="grid grid-cols-2 gap-4">
+                                    {data.tipo === 'cuotas' ? (<><div><label className="label">Total Cuotas</label><input type="number" value={data.cuotas} onChange={e=>setData({...data, cuotas:e.target.value})} className="input font-bold text-center" /></div><div><label className="label">{mode==='total'?'Monto Total':'Valor 1 Cuota'}</label>{mode==='total' ? (<input type="number" step="0.01" value={data.montoTotal} onChange={e=>setData({...data, montoTotal:parseFloat(e.target.value)})} className="input" placeholder="0.00" />) : (<input type="number" step="0.01" value={cuotaVal} onChange={e=>setCuotaVal(e.target.value)} className="input text-blue-600 font-bold" placeholder="0.00" />)}</div></>) : (<div className="col-span-2"><label className="label">Monto</label><input type="number" step="0.01" value={data.montoTotal} onChange={e=>setData({...data, montoTotal:parseFloat(e.target.value)})} className="input text-lg" placeholder="0.00" /></div>)}
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <div className="relative" ref={catInputRef}><label className="label">Categoría</label><div className="relative"><input value={data.categoria} onChange={e => { setData({...data, categoria: e.target.value}); openDropdown(); }} onFocus={openDropdown} className="input pr-10" placeholder="Escribe o selecciona..." /><button type="button" onClick={() => { if (catOpen) setCatOpen(false); else openDropdown(); }} className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-md hover:bg-gray-100 text-gray-400"><i data-lucide="chevron-down" className="w-4 h-4"></i></button></div></div>
+                                <div><label className="label flex justify-between"><span>Inicio / 1ra Cuota</span>{data.tipo === 'cuotas' && <span className="text-[10px] text-blue-600 cursor-help">¿Cuota actual?</span>}</label><div className="flex gap-2"><input type="date" value={data.fechaInicio} onChange={e=>setData({...data, fechaInicio:e.target.value})} className="input flex-1" />{data.tipo === 'cuotas' && (<select className="w-16 input px-1 text-xs bg-blue-50 border-blue-200 text-blue-700 font-bold" value={currentQuoteNum} onChange={(e) => handleCurrentQuoteChange(e.target.value)}>{Array.from({length: parseInt(data.cuotas) || 12}, (_, i) => i + 1).map(n => (<option key={n} value={n}>{n}</option>))}</select>)}</div></div>
+                            </div>
+                        </div>
+                        <div className="p-4 border-t flex gap-3">{initial && <button onClick={()=>onDelete(initial.id)} className="p-3 text-red-500 bg-red-50 rounded-xl"><i data-lucide="trash-2"></i></button>}<button onClick={onClose} className="flex-1 py-3 text-gray-500 font-medium hover:bg-gray-100 rounded-xl">Cancelar</button><button onClick={()=>onSave(data)} className="flex-1 py-3 bg-blue-600 text-white font-bold rounded-xl shadow-lg hover:bg-blue-700">Guardar</button></div>
+                    </div>
+                    {catOpen && (<div ref={dropdownRef} className="fixed bg-white border border-gray-200 rounded-lg shadow-2xl overflow-y-auto z-[100]" style={{ top: dropdownPos.top, left: dropdownPos.left, width: dropdownPos.width, maxHeight: '200px' }} onMouseDown={(e) => e.preventDefault()}>{filteredCats.map(c => (<div key={c} className="p-3 hover:bg-blue-50 cursor-pointer border-b border-gray-50 last:border-0 text-sm flex items-center justify-between" onClick={() => { setData({...data, categoria: c}); setCatOpen(false); }}><span>{c}</span>{data.categoria.toLowerCase() === c.toLowerCase() && <i data-lucide="check" className="w-3 h-3 text-blue-600"></i>}</div>))}{filteredCats.length === 0 && (<div className="p-3 text-gray-400 text-xs italic">Se creará "{data.categoria}" al guardar</div>)}</div>)}
+                </div>
+            );
+        }
+
+        function ConfigModal({ onClose, config, setConfig, data, exportCurrent }) {
+            const exportAllCSV = () => { let csv = "Fecha Inicio;Concepto;Categoría;Tipo;Cuotas;Moneda;Monto Total Compra\n"; data.forEach(d => { const montoFmt = d.montoTotal.toFixed(2).replace('.', ','); const conceptoClean = (d.concepto || "").replace(/;/g, ' '); csv += `${d.fechaInicio};"${conceptoClean}";"${d.categoria}";${d.tipo};${d.cuotas};${d.moneda};${montoFmt}\n`; }); downloadExcelCSV(csv, "historial_completo_gastos.csv"); };
+            const exportJSON = () => { const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(data)); const link = document.createElement("a"); link.setAttribute("href", dataStr); link.setAttribute("download", "backup_gastos.json"); document.body.appendChild(link); link.click(); link.remove(); };
+            const importJSON = (e) => { const reader = new FileReader(); reader.readAsText(e.target.files[0], "UTF-8"); reader.onload = evt => { try { alert("Para importar, usa el botón de Restaurar y recarga la página (simulado). En una app real esto actualizaría el estado."); } catch (err) { alert('Error al leer el archivo'); } }; };
+            return (<div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 backdrop-blur-sm"><div className="bg-white w-full max-w-sm rounded-2xl p-6 shadow-2xl"><h3 className="font-bold text-lg mb-4">Configuración</h3><div className="space-y-4"><div><label className="label">Dólar Tarjeta</label><input type="number" value={config.dolarTarjeta} onChange={e=>setConfig({...config, dolarTarjeta:parseFloat(e.target.value)})} className="input" /></div><hr/><h3 className="text-xs font-bold text-gray-400 uppercase">Exportar Datos</h3><button onClick={exportCurrent} className="w-full btn-sec bg-green-50 text-green-700 border-green-200"><i data-lucide="sheet" className="w-4 h-4"></i> Exportar Mes Actual (Excel)</button><button onClick={exportAllCSV} className="w-full btn-sec bg-blue-50 text-blue-700 border-blue-200"><i data-lucide="database" className="w-4 h-4"></i> Exportar Historial Completo</button><h3 className="text-xs font-bold text-gray-400 uppercase mt-2">Sistema</h3><div className="grid grid-cols-2 gap-3"><button onClick={exportJSON} className="btn-sec">Backup JSON</button><label className="btn-sec cursor-pointer">Restaurar <input type="file" className="hidden" onChange={(e) => { const reader = new FileReader(); reader.readAsText(e.target.files[0], "UTF-8"); reader.onload = evt => { localStorage.setItem('gastos_v4_db', evt.target.result); window.location.reload(); }; }}/></label></div></div><button onClick={onClose} className="mt-6 w-full py-3 text-gray-500 font-medium">Cerrar</button></div></div>);
+        }
+
+        const btnClass = "w-full p-3 rounded-xl font-bold flex items-center justify-center gap-2 transition-transform active:scale-95";
+        
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<ErrorBoundary><App /></ErrorBoundary>);
+    </script>
+    <style>
+        .input { width: 100%; padding: 0.75rem; border-radius: 0.75rem; border: 1px solid #e5e7eb; outline: none; transition: all; }
+        .input:focus { border-color: #3b82f6; ring: 2px solid #93c5fd; }
+        .label { display: block; font-size: 0.75rem; font-weight: 700; color: #6b7280; text-transform: uppercase; margin-bottom: 0.25rem; }
+        .btn-sec { padding: 0.75rem; border-radius: 0.75rem; border: 1px solid #e5e7eb; background: #f9fafb; color: #374151; font-weight: 500; font-size: 0.875rem; display: flex; align-items: center; justify-content: center; gap: 0.5rem; }
+        .btn-sec:hover { background: #f3f4f6; }
+    </style>
+</body>
+</html>
