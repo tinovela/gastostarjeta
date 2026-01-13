@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Gestor de Gastos v5.8</title>
+    <title>Gestor de Gastos v6.0</title>
     
     <!-- React y ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
@@ -31,6 +31,8 @@
         .fade-enter { opacity: 0; }
         .fade-enter-active { opacity: 1; transition: opacity 200ms; }
         .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+        .custom-scroll::-webkit-scrollbar { width: 4px; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #e5e7eb; border-radius: 4px; }
     </style>
 </head>
 <body>
@@ -39,7 +41,7 @@
     <script type="text/babel">
         const { useState, useEffect, useMemo, useRef, Component } = React;
         const Recharts = window.Recharts || {};
-        const { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend } = Recharts;
+        const { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, XAxis, YAxis, CartesianGrid } = Recharts;
 
         // --- Error Boundary ---
         class ErrorBoundary extends Component {
@@ -85,7 +87,7 @@
         const formatDate = (isoString) => {
             if (!isoString) return '';
             const [y, m, d] = isoString.split('-');
-            return `${d}/${m}/${y}`; // Formato local simple
+            return `${d}/${m}/${y}`;
         };
 
         const downloadExcelCSV = (content, filename) => {
@@ -112,7 +114,7 @@
                     return parsed.map(g => ({
                         ...g, id: g.id || Date.now() + Math.random(),
                         fechaInicio: g.fechaInicio || new Date().toISOString().split('T')[0],
-                        fechaCompra: g.fechaCompra || g.fechaInicio || new Date().toISOString().split('T')[0], // Fallback para datos viejos
+                        fechaCompra: g.fechaCompra || g.fechaInicio || new Date().toISOString().split('T')[0],
                         montoTotal: Number(g.montoTotal) || 0,
                         cuotas: Number(g.cuotas) || 1,
                         concepto: g.concepto || "Sin nombre",
@@ -186,7 +188,7 @@
                 }).filter(Boolean);
             };
 
-            const gastosDelMes = useMemo(() => getGastosForDate(viewDate), [gastos, viewDate, config]); // Se ordena en el componente Dashboard
+            const gastosDelMes = useMemo(() => getGastosForDate(viewDate), [gastos, viewDate, config]); 
             const totales = useMemo(() => gastosDelMes.reduce((acc, curr) => ({ ars: acc.ars + curr.montoARS, usd: acc.usd + (curr.moneda === 'USD' ? curr.montoPagar : 0) }), { ars: 0, usd: 0 }), [gastosDelMes]);
 
             // Actions
@@ -260,7 +262,7 @@
                         {currentView === 'dashboard' && <Dashboard gastos={gastosDelMes} total={totales} onEdit={(g)=>{setEditingGasto(g); setModalOpen(true);}} />}
                         {currentView === 'fixed' && <FixedExpensesView gastos={gastos} config={config} onEdit={(g)=>{setEditingGasto(g); setModalOpen(true);}} onOpenSkipper={(id)=>{setSkipperGastoId(id); setSkipperOpen(true);}} />}
                         {currentView === 'projection' && <Projection gastos={gastos} current={viewDate} calculator={getGastosForDate} />}
-                        {currentView === 'stats' && <Stats gastos={gastos} currentMonthGastos={gastosDelMes} total={totales.ars} colors={CAT_COLORS} config={config} currentDate={viewDate} />}
+                        {currentView === 'stats' && <Stats gastos={gastos} currentMonthGastos={gastosDelMes} total={totales.ars} colors={CAT_COLORS} config={config} currentDate={viewDate} calculator={getGastosForDate} />}
                         {currentView === 'calculator' && <FinancialCalculator />}
                     </main>
 
@@ -314,7 +316,7 @@
         }
 
         function Dashboard({ gastos, total, onEdit }) {
-            const [sortBy, setSortBy] = useState('remaining'); // remaining, date, amount
+            const [sortBy, setSortBy] = useState('remaining'); 
 
             const breakdown = useMemo(() => gastos.reduce((acc, g) => { if (g.tipo === 'fijo') { acc.fijos += g.montoARS; } else { acc.cuotas += g.montoARS; if (g.remaining === 0) acc.liberado += g.montoARS; } return acc; }, { fijos: 0, cuotas: 0, liberado: 0 }), [gastos]);
             
@@ -464,11 +466,66 @@
             );
         }
 
-        // --- STATS WITH ACCORDION DEBT ---
-        function Stats({ gastos, currentMonthGastos, total, colors, config, currentDate }) {
+        // --- STATS WITH ACCORDION DEBT & DUAL MODE CHART ---
+        function Stats({ gastos, currentMonthGastos, total, colors, config, currentDate, calculator }) {
+            const [chartMode, setChartMode] = useState('projection'); // 'projection' | 'history'
             const dataMonth = useMemo(() => { const map = {}; currentMonthGastos.forEach(g => map[g.categoria] = (map[g.categoria]||0) + g.montoARS); return Object.entries(map).map(([name, value]) => ({name, value})).sort((a,b)=>b.value-a.value); }, [currentMonthGastos]);
             
             const [expandedCat, setExpandedCat] = useState(null);
+
+            // Annual Projection Data for Bar Chart
+            const chartData = useMemo(() => {
+                if (chartMode === 'projection') {
+                    // NEXT 6 MONTHS (Future Payments)
+                    return Array.from({length: 6}, (_, i) => { 
+                        const d = new Date(currentDate.getFullYear(), currentDate.getMonth()+i, 1);
+                        const items = calculator(d);
+                        const totalAmount = items.reduce((s, x)=>s+x.montoARS, 0);
+                        const itemList = items.map(x => ({concept: x.concepto, value: x.montoARS})).sort((a,b) => b.value - a.value);
+                        return {
+                            name: d.toLocaleDateString('es-AR', {month:'short'}), 
+                            fullDate: d.toLocaleDateString('es-AR', {month:'long', year:'numeric'}),
+                            amount: totalAmount,
+                            count: items.length,
+                            items: itemList
+                        };
+                    });
+                } else {
+                    // LAST 6 MONTHS (Purchase History)
+                    // We look at 'gastos' and group by 'fechaCompra' month
+                    return Array.from({length: 6}, (_, i) => {
+                        // Calculate month going backwards: 0 = current, 1 = prev, etc.
+                        // Actually, let's show [Current-5, Current]
+                        const d = new Date(currentDate.getFullYear(), currentDate.getMonth() - 5 + i, 1);
+                        const monthStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+                        
+                        // Filter expenses that were BOUGHT in this month
+                        const items = gastos.filter(g => {
+                            if (!g.fechaCompra) return false;
+                            return g.fechaCompra.startsWith(monthStr);
+                        });
+                        
+                        const totalAmount = items.reduce((s, x) => {
+                            // Sum full purchase amount (montoTotal)
+                            const val = x.moneda === 'USD' ? x.montoTotal * config.dolarTarjeta : x.montoTotal;
+                            return s + val;
+                        }, 0);
+
+                        const itemList = items.map(x => ({
+                            concept: x.concepto, 
+                            value: x.moneda === 'USD' ? x.montoTotal * config.dolarTarjeta : x.montoTotal
+                        })).sort((a,b) => b.value - a.value);
+
+                        return {
+                            name: d.toLocaleDateString('es-AR', {month:'short'}),
+                            fullDate: d.toLocaleDateString('es-AR', {month:'long', year:'numeric'}),
+                            amount: totalAmount,
+                            count: items.length,
+                            items: itemList
+                        };
+                    });
+                }
+            }, [gastos, currentDate, calculator, chartMode, config]);
 
             const debtData = useMemo(() => {
                 const map = {}; // category -> total
@@ -478,7 +535,6 @@
 
                 gastos.forEach(g => {
                     if(g.tipo !== 'cuotas' && g.tipo !== 'unico') return; 
-                    // Unico payment also counts as debt if future
                     const parts = (g.fechaInicio || "").split('-'); if(parts.length!==3) return;
                     const [y, m, d] = parts.map(Number); const start = new Date(y, m - 1, 1);
                     const diff = getMonthDiff(start, currentMonthStart);
@@ -488,8 +544,8 @@
                         if (diff >= 0 && diff < g.cuotas) remainingInstallments = g.cuotas - diff; 
                         else if (diff < 0) remainingInstallments = g.cuotas;
                     } else {
-                        if (diff < 0) remainingInstallments = 1; // Future single payment
-                        else if (diff === 0) remainingInstallments = 1; // Current single payment (is debt until paid)
+                        if (diff < 0) remainingInstallments = 1; 
+                        else if (diff === 0) remainingInstallments = 1; 
                     }
 
                     if (remainingInstallments > 0) {
@@ -502,20 +558,71 @@
                     }
                 });
                 
-                // Sort items inside details by debt amount
                 Object.keys(details).forEach(cat => {
                     details[cat].sort((a, b) => b.debtARS - a.debtARS);
                 });
 
                 return { 
-                    list: Object.entries(map).map(([name, value]) => ({name, value, items: details[name]})).sort((a,b)=>b.value-a.value), // Sort by value desc
+                    list: Object.entries(map).map(([name, value]) => ({name, value, items: details[name]})).sort((a,b)=>b.value-a.value),
                     total: granTotal
                 };
             }, [gastos, config, currentDate]);
 
+            const CustomTooltip = ({ active, payload, label }) => {
+                if (active && payload && payload.length) {
+                    const data = payload[0].payload;
+                    return (
+                        <div className="bg-white p-3 border border-gray-200 shadow-xl rounded-lg z-50">
+                            <p className="font-bold text-gray-800 capitalize mb-1">{data.fullDate}</p>
+                            <p className="text-blue-600 font-bold text-lg mb-2">$ {data.amount.toLocaleString('es-AR', {maximumFractionDigits:0})}</p>
+                            <div className="max-h-32 overflow-y-auto custom-scroll text-xs text-gray-600 space-y-1">
+                                {data.items.slice(0, 10).map((it, idx) => (
+                                    <div key={idx} className="flex justify-between gap-4">
+                                        <span className="truncate max-w-[120px]">{it.concept}</span>
+                                        <span className="font-medium">$ {Math.round(it.value).toLocaleString()}</span>
+                                    </div>
+                                ))}
+                                {data.items.length > 10 && <p className="text-center italic text-gray-400">...y {data.items.length - 10} más</p>}
+                            </div>
+                            <div className="border-t border-gray-100 mt-2 pt-1 text-[10px] text-gray-400 text-center">
+                                Total: {data.count} movimientos
+                            </div>
+                        </div>
+                    );
+                }
+                return null;
+            };
+
             if(!PieChart) return null;
             return (
                 <div className="space-y-8 animate-fade-in">
+                    {/* DUAL MODE CHART */}
+                    <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-200">
+                        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-2">
+                            <h3 className="font-bold text-gray-800 flex items-center gap-2"><i data-lucide="bar-chart-3" className="text-blue-500"></i> {chartMode === 'projection' ? 'Proyección de Pagos' : 'Historial de Compras'}</h3>
+                            <div className="bg-gray-100 p-1 rounded-lg flex text-xs font-medium">
+                                <button onClick={() => setChartMode('projection')} className={`px-3 py-1.5 rounded-md transition ${chartMode === 'projection' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>Proyección</button>
+                                <button onClick={() => setChartMode('history')} className={`px-3 py-1.5 rounded-md transition ${chartMode === 'history' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>Historial</button>
+                            </div>
+                        </div>
+                        <div className="h-64">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={chartData} margin={{top: 5, right: 5, left: -20, bottom: 0}}>
+                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                                    <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fill: '#9ca3af', fontSize: 12}} />
+                                    <YAxis axisLine={false} tickLine={false} tick={{fill: '#9ca3af', fontSize: 12}} tickFormatter={(value) => `$${value/1000}k`} />
+                                    <Tooltip content={<CustomTooltip />} cursor={{fill: '#f9fafb'}} />
+                                    <Bar dataKey="amount" fill={chartMode === 'projection' ? '#3b82f6' : '#8b5cf6'} radius={[4, 4, 0, 0]} barSize={32} />
+                                </BarChart>
+                            </ResponsiveContainer>
+                        </div>
+                        <p className="text-center text-xs text-gray-400 mt-2">
+                            {chartMode === 'projection' 
+                                ? 'Muestra cuánto tendrás que pagar cada mes (cuotas + fijos).' 
+                                : 'Muestra el valor total de las compras realizadas en cada mes.'}
+                        </p>
+                    </div>
+
                     <div className="grid md:grid-cols-2 gap-8 bg-white p-6 rounded-2xl shadow-sm border border-gray-200">
                         <div><h3 className="font-bold text-gray-800 mb-4">Gasto por Categoría (Mes)</h3><div className="h-64"><ResponsiveContainer><PieChart><Pie data={dataMonth} innerRadius={60} outerRadius={80} paddingAngle={2} dataKey="value">{dataMonth.map((_, i) => <Cell key={i} fill={colors[i%colors.length]} />)}</Pie><Tooltip formatter={(v)=>`$${v.toLocaleString()}`} /><Legend /></PieChart></ResponsiveContainer></div></div>
                         <div className="space-y-3">{dataMonth.map((x, i) => (<div key={i} className="flex items-center justify-between p-2 rounded hover:bg-gray-50"><div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full" style={{backgroundColor:colors[i%colors.length]}}></div><span className="font-medium text-sm text-gray-700">{x.name}</span></div><div className="text-right"><div className="font-bold text-sm">$ {x.value.toLocaleString()}</div><div className="text-xs text-gray-400">{((x.value/total)*100).toFixed(1)}%</div></div></div>))}</div>
@@ -565,13 +672,13 @@
             );
         }
 
-        // --- Forms ---
+        // --- Forms (Same as before) ---
         function FormModal({ onClose, onSave, onDelete, initial, cats, viewDate }) {
             const [mode, setMode] = useState('total');
             const [data, setData] = useState(initial || { 
                 concepto: '', montoTotal: '', moneda: 'ARS', tipo: 'cuotas', cuotas: 1, 
                 fechaInicio: new Date(viewDate).toISOString().split('T')[0], 
-                fechaCompra: new Date().toISOString().split('T')[0], // Default today for purchase date
+                fechaCompra: new Date().toISOString().split('T')[0], 
                 categoria: '' 
             });
             const [cuotaVal, setCuotaVal] = useState(''); const [smartText, setSmartText] = useState(''); const [currentQuoteNum, setCurrentQuoteNum] = useState(1);
