@@ -51,7 +51,7 @@
             }
             static getDerivedStateFromError(error) { return { hasError: true, error }; }
             resetApp = () => {
-                if(confirm("Esto borrará solo los gastos guardados en esta aplicación. ¿Continuar?")) {
+                if(confirm("Esto borrará solo los gastos guardados en esta aplicación para intentar recuperarla. No afecta a tu teléfono ni a otras apps. ¿Continuar?")) {
                     localStorage.removeItem('gastos_v4_db');
                     localStorage.removeItem('gastos_v4_config');
                     window.location.reload();
